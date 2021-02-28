@@ -18,16 +18,16 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
     fs::File,
     io::Write,
     iter,
     path::{Component, Path, PathBuf},
     process::Command,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Arc, Mutex},
 };
 
-// normalize a/../b => a/b
+// normalize a/b/../c => a/c
 pub fn normalize_dotdot(path: &Path) -> PathBuf {
     let mut ret = PathBuf::new();
 
@@ -90,6 +90,27 @@ struct RuleContext<'meta> {
     paths: &'meta Paths,
     index: index::Index<'meta>,
     done: Mutex<HashSet<&'meta PkgId>>,
+    fixups: Mutex<HashMap<&'meta str, Arc<Fixups<'meta>>>>,
+}
+
+impl<'meta> RuleContext<'meta> {
+    fn get_fixups(
+        &self,
+        config: &'meta Config,
+        paths: &Paths,
+        index: &'meta index::Index,
+        package: &'meta Manifest,
+        target: &'meta ManifestTarget,
+    ) -> Result<Arc<Fixups>> {
+        let mut fixups = self.fixups.lock().unwrap();
+        match fixups.entry(package.name.as_str()) {
+            Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
+            Entry::Vacant(entry) => {
+                let fixups = Fixups::new(config, paths, index, package, target)?;
+                Ok(Arc::clone(entry.insert(Arc::new(fixups))))
+            }
+        }
+    }
 }
 
 /// Generate rules for a set of dependencies
@@ -160,7 +181,7 @@ fn generate_target_rules<'scope>(
 
     log::info!("Generating rules for package {} target {}", pkg, tgt.name);
 
-    let fixups = Fixups::new(config, paths, index, pkg, tgt)?;
+    let fixups = context.get_fixups(config, paths, index, pkg, tgt)?;
 
     if fixups.omit_target() {
         return Ok((vec![], vec![]));
@@ -472,6 +493,7 @@ pub(crate) fn buckify(config: &Config, args: &Args, paths: &Paths) -> Result<()>
         paths,
         index,
         done: Mutex::new(HashSet::new()),
+        fixups: Mutex::new(HashMap::new()),
     };
 
     let (tx, rx) = mpsc::channel();
